@@ -46,32 +46,16 @@ use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Clone, Default)]
 struct UpstreamProbe {
-    inner: Arc<Mutex<UpstreamProbeInner>>,
-}
-
-#[derive(Default)]
-struct UpstreamProbeInner {
-    seen_headers: Vec<Option<String>>,
-    block_number: u64,
+    seen_headers: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl UpstreamProbe {
     fn record(&self, auth: Option<String>) {
-        let mut g = self.inner.lock().unwrap();
-        g.seen_headers.push(auth);
-        g.block_number += 1;
+        self.seen_headers.lock().unwrap().push(auth);
     }
 
     fn snapshot(&self) -> Vec<Option<String>> {
-        self.inner.lock().unwrap().seen_headers.clone()
-    }
-
-    fn count(&self) -> usize {
-        self.inner.lock().unwrap().seen_headers.len()
-    }
-
-    fn current_block(&self) -> u64 {
-        self.inner.lock().unwrap().block_number
+        self.seen_headers.lock().unwrap().clone()
     }
 }
 
@@ -86,12 +70,7 @@ async fn upstream_handler(
         .map(|s| s.to_string());
     probe.record(auth);
 
-    let blk = probe.current_block();
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": format!("0x{:x}", blk),
-    });
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": "0x1" });
     let response = HyperResponse::builder()
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body.to_string())))
@@ -198,79 +177,77 @@ async fn start_helios_like_server(provider: RootProvider) -> (SocketAddr, Server
     (addr, handle)
 }
 
-#[tokio::test]
-async fn http_call_forwards_auth_header_to_upstream() {
+struct TestStack {
+    helios_addr: SocketAddr,
+    probe: UpstreamProbe,
+    _handle: ServerHandle,
+}
+
+async fn setup() -> TestStack {
     let (upstream_addr, probe) = spawn_upstream().await;
     let provider = build_alloy_client(upstream_addr);
-    let (helios_addr, _handle) = start_helios_like_server(provider).await;
+    let (helios_addr, handle) = start_helios_like_server(provider).await;
+    TestStack {
+        helios_addr,
+        probe,
+        _handle: handle,
+    }
+}
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{helios_addr}"))
-        .header(http::header::AUTHORIZATION, "Bearer http-token")
+async fn post_rpc(addr: SocketAddr, auth: Option<&str>, url_suffix: &str) -> Value {
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}{url_suffix}"))
         .json(&serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "probe_callUpstream"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }));
+    if let Some(value) = auth {
+        req = req.header(http::header::AUTHORIZATION, value);
+    }
+    let resp = req.send().await.unwrap();
     assert!(resp.status().is_success(), "status {}", resp.status());
-    let json: Value = resp.json().await.unwrap();
-    assert!(json.get("error").is_none(), "rpc error: {json}");
+    resp.json().await.unwrap()
+}
 
-    let seen = probe.snapshot();
-    assert_eq!(seen, vec![Some("Bearer http-token".into())]);
+#[tokio::test]
+async fn http_call_forwards_auth_header_to_upstream() {
+    let stack = setup().await;
+    let json = post_rpc(stack.helios_addr, Some("Bearer http-token"), "").await;
+    assert!(json.get("error").is_none(), "rpc error: {json}");
+    assert_eq!(
+        stack.probe.snapshot(),
+        vec![Some("Bearer http-token".into())]
+    );
 }
 
 #[tokio::test]
 async fn http_call_forwards_query_auth_to_upstream() {
-    let (upstream_addr, probe) = spawn_upstream().await;
-    let provider = build_alloy_client(upstream_addr);
-    let (helios_addr, _handle) = start_helios_like_server(provider).await;
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{helios_addr}/?authorization=Bearer%20query-token"))
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "probe_callUpstream"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
-
-    let seen = probe.snapshot();
-    assert_eq!(seen, vec![Some("Bearer query-token".into())]);
+    let stack = setup().await;
+    let _ = post_rpc(
+        stack.helios_addr,
+        None,
+        "/?authorization=Bearer%20query-token",
+    )
+    .await;
+    assert_eq!(
+        stack.probe.snapshot(),
+        vec![Some("Bearer query-token".into())]
+    );
 }
 
 #[tokio::test]
 async fn http_call_without_auth_propagates_no_header() {
-    let (upstream_addr, probe) = spawn_upstream().await;
-    let provider = build_alloy_client(upstream_addr);
-    let (helios_addr, _handle) = start_helios_like_server(provider).await;
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{helios_addr}"))
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "probe_callUpstream"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
-
-    let seen = probe.snapshot();
-    assert_eq!(seen, vec![None]);
+    let stack = setup().await;
+    let _ = post_rpc(stack.helios_addr, None, "").await;
+    assert_eq!(stack.probe.snapshot(), vec![None]);
 }
 
 #[tokio::test]
 async fn ws_subscription_forwards_auth_inside_spawn() {
-    let (upstream_addr, probe) = spawn_upstream().await;
-    let provider = build_alloy_client(upstream_addr);
-    let (helios_addr, _handle) = start_helios_like_server(provider).await;
+    let stack = setup().await;
 
-    let mut req = format!("ws://{helios_addr}").into_client_request().unwrap();
+    let mut req = format!("ws://{}", stack.helios_addr)
+        .into_client_request()
+        .unwrap();
     req.headers_mut().insert(
         http::header::AUTHORIZATION,
         http::HeaderValue::from_static("Bearer ws-token"),
@@ -282,36 +259,21 @@ async fn ws_subscription_forwards_auth_inside_spawn() {
     });
     ws.send(Message::Text(sub_call.to_string())).await.unwrap();
 
-    // Drain frames until we see the notification (not the subscription-id response).
     let mut got_notif = false;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            ws.next(),
-        )
-        .await
-        {
-            Ok(Some(Ok(Message::Text(t)))) => {
-                let v: Value = serde_json::from_str(&t).unwrap();
-                if v.get("method").and_then(|m| m.as_str()) == Some("probe_subscribe") {
-                    got_notif = true;
-                    break;
-                }
+    let read_loop = async {
+        while let Some(Ok(Message::Text(t))) = ws.next().await {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v.get("method").and_then(|m| m.as_str()) == Some("probe_subscribe") {
+                got_notif = true;
+                return;
             }
-            Ok(Some(_)) => continue,
-            _ => continue,
         }
-        if probe.count() > 0 {
-            // Give the subscription notification frame an extra tick to arrive
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), read_loop).await;
     assert!(got_notif, "did not receive subscription notification");
 
-    let seen = probe.snapshot();
     assert_eq!(
-        seen,
+        stack.probe.snapshot(),
         vec![Some("Bearer ws-token".into())],
         "upstream did not see the WS Authorization"
     );

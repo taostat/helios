@@ -33,6 +33,7 @@ use futures::future::BoxFuture;
 use http::{Extensions, HeaderValue};
 use jsonrpsee::server::middleware::rpc::RpcServiceT;
 use jsonrpsee::types::Request as RpcRequest;
+use url::form_urlencoded;
 
 const AUTH_QUERY_KEY: &str = "authorization";
 const ENV_VAR_NAME: &str = "HELIOS_FORWARD_AUTH";
@@ -41,7 +42,14 @@ const ENABLED_VALUE: &str = "1";
 /// Wrapper around a captured `Authorization` header so it can be
 /// distinguished from other [`http::Extensions`] values.
 #[derive(Clone, Debug)]
-pub struct AuthValue(pub HeaderValue);
+pub struct AuthValue(HeaderValue);
+
+impl AuthValue {
+    /// Borrow the wrapped header value.
+    pub fn header(&self) -> &HeaderValue {
+        &self.0
+    }
+}
 
 tokio::task_local! {
     /// The `Authorization` value currently in scope for outbound
@@ -134,42 +142,9 @@ fn extract_auth_from_request<B>(req: &http::Request<B>) -> Option<HeaderValue> {
 }
 
 fn extract_auth_from_query(query: &str) -> Option<HeaderValue> {
-    for pair in query.split('&') {
-        let mut split = pair.splitn(2, '=');
-        let key = split.next()?;
-        if !key.eq_ignore_ascii_case(AUTH_QUERY_KEY) {
-            continue;
-        }
-        let raw = split.next()?;
-        let decoded = percent_decode(raw);
-        return HeaderValue::from_str(&decoded).ok();
-    }
-    None
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(decoded) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("ZZ"),
-                16,
-            ) {
-                out.push(decoded);
-                i += 3;
-                continue;
-            }
-        }
-        if bytes[i] == b'+' {
-            out.push(b' ');
-        } else {
-            out.push(bytes[i]);
-        }
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_default()
+    form_urlencoded::parse(query.as_bytes())
+        .find(|(k, _)| k.eq_ignore_ascii_case(AUTH_QUERY_KEY))
+        .and_then(|(_, v)| HeaderValue::from_str(&v).ok())
 }
 
 // ---------- JSON-RPC scope: hoist captured value into task-local ----------
@@ -271,17 +246,16 @@ mod tests {
     use tower::{Layer, ServiceExt};
 
     #[test]
-    fn percent_decoding_handles_encoded_bytes_and_plus() {
-        assert_eq!(percent_decode("Bearer%20abc"), "Bearer abc");
-        assert_eq!(percent_decode("a+b"), "a b");
-        assert_eq!(percent_decode("plain"), "plain");
-    }
-
-    #[test]
     fn extract_query_finds_authorization_case_insensitive() {
         let v =
             extract_auth_from_query("foo=bar&Authorization=Bearer%20xyz&baz=qux").unwrap();
         assert_eq!(v.to_str().unwrap(), "Bearer xyz");
+    }
+
+    #[test]
+    fn extract_query_decodes_plus_as_space() {
+        let v = extract_auth_from_query("authorization=Bearer+abc").unwrap();
+        assert_eq!(v.to_str().unwrap(), "Bearer abc");
     }
 
     #[test]
@@ -489,7 +463,6 @@ mod tests {
     fn is_enabled_reads_env_var() {
         let prior = env::var(ENV_VAR_NAME).ok();
 
-        // SAFETY: tests guarded by the env-var dance below.
         unsafe { env::set_var(ENV_VAR_NAME, ENABLED_VALUE) };
         assert!(is_enabled());
 
