@@ -11,10 +11,14 @@ use alloy::rpc::types::{
     Log, SyncStatus,
 };
 use eyre::{eyre, Result};
+use http::Extensions;
 use jsonrpsee::{
     core::{async_trait, server::Methods, SubscriptionResult},
     proc_macros::rpc,
-    server::{PendingSubscriptionSink, ServerBuilder, ServerHandle, SubscriptionMessage},
+    server::{
+        middleware::rpc::RpcServiceBuilder, PendingSubscriptionSink, ServerBuilder, ServerHandle,
+        SubscriptionMessage,
+    },
     types::error::{ErrorObject, ErrorObjectOwned},
 };
 
@@ -23,6 +27,7 @@ use helios_common::{
     types::{SubEventRx, SubscriptionType},
 };
 
+use crate::auth_forwarding::{auth_from_extensions, scope_with_auth, AuthCaptureLayer, AuthScopeLayer};
 use crate::client::api::HeliosApi;
 
 pub type Handle = ServerHandle;
@@ -31,7 +36,6 @@ pub async fn start<N: NetworkSpec>(
     client: Arc<dyn HeliosApi<N>>,
     addr: SocketAddr,
 ) -> Result<ServerHandle> {
-    let server = ServerBuilder::default().build(addr).await?;
     let rpc = JsonRpc {
         client,
         phantom: PhantomData,
@@ -48,7 +52,21 @@ pub async fn start<N: NetworkSpec>(
     methods.merge(web3_methods)?;
     methods.merge(helios_methods)?;
 
-    Ok(server.start(methods))
+    let handle = if crate::auth_forwarding::is_enabled() {
+        let http_middleware = tower::ServiceBuilder::new().layer(AuthCaptureLayer);
+        let rpc_middleware = RpcServiceBuilder::new().layer(AuthScopeLayer);
+        let server = ServerBuilder::default()
+            .set_http_middleware(http_middleware)
+            .set_rpc_middleware(rpc_middleware)
+            .build(addr)
+            .await?;
+        server.start(methods)
+    } else {
+        let server = ServerBuilder::default().build(addr).await?;
+        server.start(methods)
+    };
+
+    Ok(handle)
 }
 
 #[derive(Clone)]
@@ -179,7 +197,7 @@ trait EthRpc<
     async fn coinbase(&self) -> Result<Address, ErrorObjectOwned>;
     #[method(name = "syncing")]
     async fn syncing(&self) -> Result<SyncStatus, ErrorObjectOwned>;
-    #[subscription(name = "subscribe", unsubscribe = "unsubscribe", item = String)]
+    #[subscription(name = "subscribe", unsubscribe = "unsubscribe", item = String, with_extensions)]
     async fn subscribe(&self, event_type: SubscriptionType) -> SubscriptionResult;
 }
 
@@ -199,7 +217,7 @@ trait Web3Rpc {
 trait HeliosRpc {
     #[method(name = "getCurrentCheckpoint")]
     async fn get_current_checkpoint(&self) -> Result<Option<B256>, ErrorObjectOwned>;
-    #[subscription(name = "subscribeNewCheckpoints", unsubscribe = "unsubscribeNewCheckpoints", item = Option<B256>)]
+    #[subscription(name = "subscribeNewCheckpoints", unsubscribe = "unsubscribeNewCheckpoints", item = Option<B256>, with_extensions)]
     async fn subscribe_new_checkpoints(&self) -> SubscriptionResult;
 }
 
@@ -439,11 +457,13 @@ impl<N: NetworkSpec>
     async fn subscribe(
         &self,
         pending: PendingSubscriptionSink,
+        ext: &Extensions,
         event_type: SubscriptionType,
     ) -> SubscriptionResult {
+        let auth = auth_from_extensions(ext);
         let maybe_rx = self.client.subscribe(event_type).await;
 
-        handle_eth_subscription(pending, maybe_rx).await
+        handle_eth_subscription(pending, maybe_rx, auth).await
     }
 }
 
@@ -470,9 +490,11 @@ impl<N: NetworkSpec> HeliosRpcServer for JsonRpc<N> {
     async fn subscribe_new_checkpoints(
         &self,
         pending: PendingSubscriptionSink,
+        ext: &Extensions,
     ) -> SubscriptionResult {
+        let auth = auth_from_extensions(ext);
         let maybe_rx = self.client.new_checkpoints_recv();
-        handle_checkpoint_subscription(pending, maybe_rx).await
+        handle_checkpoint_subscription(pending, maybe_rx, auth).await
     }
 }
 
@@ -484,18 +506,22 @@ fn convert_err<T, E: Display>(res: Result<T, E>) -> Result<T, ErrorObjectOwned> 
 async fn handle_eth_subscription<N: NetworkSpec>(
     pending: PendingSubscriptionSink,
     maybe_rx: Result<SubEventRx<N>>,
+    auth: Option<crate::auth_forwarding::AuthValue>,
 ) -> SubscriptionResult {
     match maybe_rx {
         Ok(mut stream) => {
             let sink = pending.accept().await?;
 
             tokio::spawn(async move {
-                while let Ok(message) = stream.recv().await {
-                    let msg = SubscriptionMessage::from_json(&message).unwrap();
-                    if sink.send(msg).await.is_err() {
-                        break;
+                scope_with_auth(auth, async move {
+                    while let Ok(message) = stream.recv().await {
+                        let msg = SubscriptionMessage::from_json(&message).unwrap();
+                        if sink.send(msg).await.is_err() {
+                            break;
+                        }
                     }
-                }
+                })
+                .await;
             });
             Ok(())
         }
@@ -516,18 +542,22 @@ async fn handle_eth_subscription<N: NetworkSpec>(
 async fn handle_checkpoint_subscription(
     pending: PendingSubscriptionSink,
     maybe_rx: Result<tokio::sync::watch::Receiver<Option<B256>>>,
+    auth: Option<crate::auth_forwarding::AuthValue>,
 ) -> SubscriptionResult {
     match maybe_rx {
         Ok(mut rx) => {
             let sink = pending.accept().await?;
             tokio::spawn(async move {
-                while rx.changed().await.is_ok() {
-                    let checkpoint = *rx.borrow_and_update();
-                    let msg = SubscriptionMessage::from_json(&checkpoint).unwrap();
-                    if sink.send(msg).await.is_err() {
-                        break;
+                scope_with_auth(auth, async move {
+                    while rx.changed().await.is_ok() {
+                        let checkpoint = *rx.borrow_and_update();
+                        let msg = SubscriptionMessage::from_json(&checkpoint).unwrap();
+                        if sink.send(msg).await.is_err() {
+                            break;
+                        }
                     }
-                }
+                })
+                .await;
             });
             Ok(())
         }
