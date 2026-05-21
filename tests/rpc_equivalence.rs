@@ -188,7 +188,7 @@ async fn setup() -> (
         let port = get_available_port();
         let helios_client = EthereumClientBuilder::new()
             .network(Network::Mainnet)
-            .verifiable_api(&format!("http://localhost:{api_port}"))
+            .verifiable_api(format!("http://localhost:{api_port}"))
             .unwrap()
             .consensus_rpc(consensus_rpc)
             .unwrap()
@@ -221,18 +221,6 @@ async fn setup() -> (
 
 fn rpc_exists() -> bool {
     env::var("MAINNET_EXECUTION_RPC").is_ok_and(|rpc| !rpc.is_empty())
-}
-
-fn ensure_rpc_env() {
-    if !rpc_exists() {
-        panic!(
-            "MAINNET_EXECUTION_RPC environment variable is required for RPC equivalence tests.\n\
-            Set it to a mainnet Ethereum RPC URL, for example:\n\
-            export MAINNET_EXECUTION_RPC=https://eth-mainnet.alchemyapi.io/v2/YOUR_API_KEY\n\
-            or\n\
-            export MAINNET_EXECUTION_RPC=https://mainnet.infura.io/v3/YOUR_PROJECT_ID"
-        );
-    }
 }
 
 async fn test_get_transaction_by_hash(
@@ -1442,7 +1430,14 @@ async fn test_call_with_combined_overrides(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_equivalence_tests() {
-    ensure_rpc_env();
+    if !rpc_exists() {
+        eprintln!(
+            "Skipping rpc_equivalence_tests: MAINNET_EXECUTION_RPC is not set.\n\
+            To run these tests locally, set MAINNET_EXECUTION_RPC to a mainnet Ethereum RPC URL, e.g.\n\
+            export MAINNET_EXECUTION_RPC=https://eth-mainnet.alchemyapi.io/v2/YOUR_API_KEY"
+        );
+        return;
+    }
 
     println!("Setting up Helios instances (this may take a few seconds)...");
     let (_handle1, _handle2, _handle3, providers) = setup().await;

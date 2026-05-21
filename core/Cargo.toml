@@ -34,8 +34,10 @@ thiserror.workspace = true
 url.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-jsonrpsee = { version = "0.19.0", features = ["full"] }
+jsonrpsee = { version = "0.24.10", features = ["full"] }
 openssl.workspace = true
+tower = "0.4"
+http = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4.33"
@@ -48,3 +50,11 @@ parking_lot = { version = "0.12.2" }
 [dev-dependencies]
 helios-test-utils = { path = "../tests/test-utils" }
 helios-ethereum = { path = "../ethereum" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
