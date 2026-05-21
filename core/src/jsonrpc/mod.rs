@@ -27,7 +27,9 @@ use helios_common::{
     types::{SubEventRx, SubscriptionType},
 };
 
-use crate::auth_forwarding::{auth_from_extensions, scope_with_auth, AuthCaptureLayer, AuthScopeLayer};
+use crate::auth_forwarding::{
+    auth_from_extensions, scope_with_auth, AuthCaptureLayer, AuthScopeLayer,
+};
 use crate::client::api::HeliosApi;
 
 pub type Handle = ServerHandle;

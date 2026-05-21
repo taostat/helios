@@ -247,8 +247,7 @@ mod tests {
 
     #[test]
     fn extract_query_finds_authorization_case_insensitive() {
-        let v =
-            extract_auth_from_query("foo=bar&Authorization=Bearer%20xyz&baz=qux").unwrap();
+        let v = extract_auth_from_query("foo=bar&Authorization=Bearer%20xyz&baz=qux").unwrap();
         assert_eq!(v.to_str().unwrap(), "Bearer xyz");
     }
 
@@ -269,8 +268,7 @@ mod tests {
     impl<B: Send + 'static> tower::Service<http::Request<B>> for CapturedExtensions {
         type Response = http::Response<()>;
         type Error = std::convert::Infallible;
-        type Future =
-            BoxFuture<'static, Result<Self::Response, Self::Error>>;
+        type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
         fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
@@ -346,8 +344,7 @@ mod tests {
     impl tower::Service<RequestPacket> for PacketProbe {
         type Response = ResponsePacket;
         type Error = TransportError;
-        type Future =
-            BoxFuture<'static, Result<Self::Response, Self::Error>>;
+        type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
         fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
@@ -355,16 +352,12 @@ mod tests {
 
         fn call(&mut self, req: RequestPacket) -> Self::Future {
             let observed = match &req {
-                RequestPacket::Single(s) => {
-                    s.meta().extensions().get::<http::HeaderMap>().cloned()
-                }
+                RequestPacket::Single(s) => s.meta().extensions().get::<http::HeaderMap>().cloned(),
                 RequestPacket::Batch(_) => None,
             };
             *self.0.lock().unwrap() = observed;
             Box::pin(async move {
-                Err::<ResponsePacket, _>(alloy::transports::TransportErrorKind::custom_str(
-                    "probe",
-                ))
+                Err::<ResponsePacket, _>(alloy::transports::TransportErrorKind::custom_str("probe"))
             })
         }
     }
@@ -407,8 +400,7 @@ mod tests {
         impl tower::Service<RequestPacket> for BatchProbe {
             type Response = ResponsePacket;
             type Error = TransportError;
-            type Future =
-                BoxFuture<'static, Result<Self::Response, Self::Error>>;
+            type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
             fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
                 Poll::Ready(Ok(()))
@@ -416,11 +408,9 @@ mod tests {
 
             fn call(&mut self, req: RequestPacket) -> Self::Future {
                 let observed = match &req {
-                    RequestPacket::Single(s) => vec![s
-                        .meta()
-                        .extensions()
-                        .get::<http::HeaderMap>()
-                        .cloned()],
+                    RequestPacket::Single(s) => {
+                        vec![s.meta().extensions().get::<http::HeaderMap>().cloned()]
+                    }
                     RequestPacket::Batch(b) => b
                         .iter()
                         .map(|s| s.meta().extensions().get::<http::HeaderMap>().cloned())
@@ -428,9 +418,9 @@ mod tests {
                 };
                 *self.0.lock().unwrap() = observed;
                 Box::pin(async move {
-                    Err::<ResponsePacket, _>(
-                        alloy::transports::TransportErrorKind::custom_str("probe"),
-                    )
+                    Err::<ResponsePacket, _>(alloy::transports::TransportErrorKind::custom_str(
+                        "probe",
+                    ))
                 })
             }
         }

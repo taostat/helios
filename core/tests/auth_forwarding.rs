@@ -29,7 +29,9 @@ use helios_core::auth_forwarding::{
 };
 use http::Extensions;
 use http_body_util::Full;
-use hyper::{body::Incoming, service::service_fn, Request as HyperRequest, Response as HyperResponse};
+use hyper::{
+    body::Incoming, service::service_fn, Request as HyperRequest, Response as HyperResponse,
+};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ServerConnBuilder;
 use jsonrpsee::core::{async_trait, server::Methods, SubscriptionResult};
@@ -106,9 +108,7 @@ async fn spawn_upstream() -> (SocketAddr, UpstreamProbe) {
 
 fn build_alloy_client(upstream_addr: SocketAddr) -> RootProvider {
     let url: reqwest::Url = format!("http://{upstream_addr}").parse().unwrap();
-    let client = ClientBuilder::default()
-        .layer(AuthForwardLayer)
-        .http(url);
+    let client = ClientBuilder::default().layer(AuthForwardLayer).http(url);
     RootProvider::new(client)
 }
 
@@ -129,9 +129,11 @@ struct ProbeRpcImpl {
 #[async_trait]
 impl ProbeRpcServer for ProbeRpcImpl {
     async fn call_upstream(&self) -> Result<String, ErrorObjectOwned> {
-        let n = self.provider.get_block_number().await.map_err(|e| {
-            ErrorObjectOwned::owned(1, e.to_string(), None::<()>)
-        })?;
+        let n = self
+            .provider
+            .get_block_number()
+            .await
+            .map_err(|e| ErrorObjectOwned::owned(1, e.to_string(), None::<()>))?;
         Ok(format!("{n}"))
     }
 
