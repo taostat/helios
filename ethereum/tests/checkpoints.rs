@@ -32,7 +32,13 @@ async fn test_construct_checkpoints() {
     assert!(cf.services[&networks::Network::Holesky].len() > 1);
 }
 
+// Hits live community checkpoint-sync endpoints, which are flaky (in
+// particular Holesky often returns no slots, causing
+// "Failed to find max epoch from checkpoint slots"). Marked ignored so the
+// default test job is deterministic; run on-demand with
+// `cargo test -- --ignored`.
 #[tokio::test]
+#[ignore]
 async fn test_fetch_latest_checkpoints() {
     let cf = checkpoints::CheckpointFallback::new()
         .build()
