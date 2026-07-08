@@ -393,11 +393,20 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
 
         self.bootstrap(checkpoint).await?;
 
-        let updates: Vec<Update<S>> = self.get_updates().await?;
+        let mut updates: Vec<Update<S>> = self.get_updates().await?;
 
+        // Beacon `light_client/updates` responses are not guaranteed to be
+        // contiguous or monotonically ordered — some CL clients return the
+        // current period first, then an older contiguous run. Sort ascending by
+        // slot and skip updates that aren't relevant to the current store,
+        // rather than aborting the whole sync on the first out-of-order update
+        // (which leaves the consensus client permanently stuck after a cold
+        // bootstrap). This mirrors the tolerant behaviour of `advance()`.
+        updates.sort_by_key(|update| update.attested_header().beacon().slot);
         for update in updates {
-            self.verify_update(&update)?;
-            self.apply_update(&update);
+            if self.verify_update(&update).is_ok() {
+                self.apply_update(&update);
+            }
         }
         let finality_update = self.rpc.get_finality_update().await?;
         self.verify_finality_update(&finality_update)?;
