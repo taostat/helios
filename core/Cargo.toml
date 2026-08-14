@@ -52,7 +52,7 @@ helios-test-utils = { path = "../tests/test-utils" }
 helios-ethereum = { path = "../ethereum" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-hyper = { version = "1", features = ["client", "http1"] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 bytes = "1"
