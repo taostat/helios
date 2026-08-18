@@ -226,10 +226,14 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Account
             .await?
             .ok_or(eyre!("block not found"))?;
 
+        // Pin every state read for this account to the same block the header
+        // came from, so the code we verify is the code the proof commits to.
+        let block_ref: BlockId = block.header().hash().into();
+
         let proof = self
             .provider
             .get_proof(address, slots.to_vec())
-            .block_id(block.header().hash().into())
+            .block_id(block_ref)
             .await?;
 
         verify_account_proof(&proof, block.header().state_root())?;
@@ -239,7 +243,11 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Account
             if proof.code_hash == KECCAK_EMPTY || proof.code_hash == B256::ZERO {
                 Some(Bytes::new())
             } else {
-                let code = self.provider.get_code_at(address).await?;
+                let code = self
+                    .provider
+                    .get_code_at(address)
+                    .block_id(block_ref)
+                    .await?;
                 verify_code_hash_proof(&proof, &code)?;
                 Some(code)
             }
@@ -493,5 +501,227 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Executi
         }
 
         Ok(account_map)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use alloy::network::Network;
+    use alloy::primitives::bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Bytes as HyperBytes;
+    use hyper::service::service_fn;
+    use hyper::{Request as HttpRequest, Response as HttpResponse};
+    use hyper_util::rt::TokioIo;
+    use serde_json::{json, Value};
+    use tokio::net::TcpListener;
+
+    use helios_ethereum::spec::Ethereum;
+    use helios_test_utils::{rpc_account, rpc_block, rpc_proof};
+
+    use super::*;
+
+    /// Serves the one fixture block for every block id, so the test exercises
+    /// only the account/code path of `get_account`.
+    struct StaticBlockProvider(<Ethereum as Network>::BlockResponse);
+
+    #[async_trait]
+    impl BlockProvider<Ethereum> for StaticBlockProvider {
+        async fn push_block(&self, _block: <Ethereum as Network>::BlockResponse, _id: BlockId) {}
+
+        async fn get_block(
+            &self,
+            _block_id: BlockId,
+            _full_tx: bool,
+        ) -> Result<Option<<Ethereum as Network>::BlockResponse>> {
+            Ok(Some(self.0.clone()))
+        }
+
+        async fn get_untrusted_block(
+            &self,
+            _block_id: BlockId,
+            _full_tx: bool,
+        ) -> Result<Option<<Ethereum as Network>::BlockResponse>> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    /// A local JSON-RPC server that records every (method, params) it is asked
+    /// for, so a test can assert on the requests helios *makes*, not only on
+    /// the answers it happens to accept.
+    struct MockRpc {
+        url: Url,
+        calls: Arc<Mutex<Vec<(String, Value)>>>,
+    }
+
+    impl MockRpc {
+        async fn spawn<F>(respond: F) -> Self
+        where
+            F: Fn(&str, &Value) -> Value + Send + Sync + 'static,
+        {
+            let calls: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+            let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let respond = Arc::new(respond);
+            let calls_srv = calls.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let respond = respond.clone();
+                    let calls = calls_srv.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: HttpRequest<hyper::body::Incoming>| {
+                            let respond = respond.clone();
+                            let calls = calls.clone();
+                            async move {
+                                let body = req.into_body().collect().await.unwrap().to_bytes();
+                                let req: Value = serde_json::from_slice(&body).unwrap();
+                                let method = req["method"].as_str().unwrap().to_string();
+                                let params = req["params"].clone();
+                                calls.lock().unwrap().push((method.clone(), params.clone()));
+                                let result = respond(&method, &params);
+                                let resp = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req["id"].clone(),
+                                    "result": result,
+                                });
+                                Ok::<_, Infallible>(HttpResponse::new(Full::new(HyperBytes::from(
+                                    serde_json::to_vec(&resp).unwrap(),
+                                ))))
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            });
+
+            MockRpc {
+                url: Url::parse(&format!("http://{addr}")).unwrap(),
+                calls,
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, Value)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    fn provider_for(mock: &MockRpc) -> RpcExecutionProvider<Ethereum, StaticBlockProvider, ()> {
+        RpcExecutionProvider::<Ethereum, StaticBlockProvider, ()>::new(
+            mock.url.clone(),
+            StaticBlockProvider(rpc_block()),
+        )
+    }
+
+    /// The code an account carries is not fixed for all time — EIP-7702 lets an
+    /// EOA gain, change and drop a delegation designator — so code read at
+    /// `latest` cannot be checked against a code hash proven at some other
+    /// block. This mock answers `eth_getCode` correctly only when the request
+    /// names the fixture block, and returns different (but well-formed) code
+    /// for any other block reference.
+    fn code_only_at_fixture_block(method: &str, params: &Value) -> Value {
+        match method {
+            "eth_getProof" => serde_json::to_value(rpc_proof()).unwrap(),
+            "eth_getCode" => {
+                let asked_for = &params[1];
+                let block_hash = rpc_block().header().hash();
+                let names_fixture_block = *asked_for == json!({ "blockHash": block_hash });
+                if names_fixture_block {
+                    json!(rpc_account().code.unwrap())
+                } else {
+                    // Stands in for "the account's code has changed since".
+                    json!(bytes!("0xef0100000000000000000000000000000000000000ff"))
+                }
+            }
+            other => panic!("unexpected upstream call: {other}"),
+        }
+    }
+
+    /// Regression: helios must read the account's code at the block whose state
+    /// root it verifies the code hash against. Reading it at `latest` makes
+    /// every historical query fail for any account whose code has since changed.
+    #[tokio::test]
+    async fn code_is_read_at_the_requested_block_not_at_latest() {
+        let mock = MockRpc::spawn(code_only_at_fixture_block).await;
+        let provider = provider_for(&mock);
+
+        let block = rpc_block();
+        let proof = rpc_proof();
+        let result = provider
+            .get_account(
+                proof.address,
+                &[],
+                true,
+                BlockId::number(block.header().number()),
+            )
+            .await;
+
+        // Assert the requests first: this is the invariant, and it is what goes
+        // red the moment the block reference is dropped from either read.
+        let block_ref = json!({ "blockHash": block.header().hash() });
+        assert_eq!(
+            mock.calls(),
+            vec![
+                (
+                    "eth_getProof".to_string(),
+                    json!([proof.address, [], block_ref]),
+                ),
+                ("eth_getCode".to_string(), json!([proof.address, block_ref])),
+            ],
+            "both the proof and the code must be read at the requested block"
+        );
+
+        let account = result.expect("account must verify when code is read at the right block");
+        assert_eq!(
+            account.code.expect("code requested"),
+            rpc_account().code.unwrap(),
+            "the code returned must be the code at the requested block"
+        );
+    }
+
+    /// The fix must not weaken the check: code that does not hash to the
+    /// state-root-proven code hash is still rejected, whatever block it came
+    /// from and whatever it looks like.
+    #[tokio::test]
+    async fn code_that_does_not_match_the_proven_hash_is_still_rejected() {
+        let mock = MockRpc::spawn(|method, _params| match method {
+            "eth_getProof" => serde_json::to_value(rpc_proof()).unwrap(),
+            // Served for *every* block reference, including the right one.
+            "eth_getCode" => json!(bytes!("0xef0100000000000000000000000000000000000000ff")),
+            other => panic!("unexpected upstream call: {other}"),
+        })
+        .await;
+        let provider = provider_for(&mock);
+
+        let block = rpc_block();
+        let proof = rpc_proof();
+        let err = provider
+            .get_account(
+                proof.address,
+                &[],
+                true,
+                BlockId::number(block.header().number()),
+            )
+            .await
+            .expect_err("code that does not match the proven code hash must be rejected");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("code hash mismatch")
+                && msg.contains(&proof.code_hash.to_string())
+                && msg.contains(&proof.address.to_string()),
+            "expected a code hash mismatch naming the address and the proven hash, got: {msg}"
+        );
     }
 }
